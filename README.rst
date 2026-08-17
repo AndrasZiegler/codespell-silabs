@@ -189,6 +189,66 @@ in a changelog):
 Unlike ``codespell:ignore``, the marker is part of the prose itself and does not
 require naming the word in a tooling comment.
 
+Comments-only spell checking (PoC)
+----------------------------------
+
+The ``--comments-only`` flag restricts spell checking to comments in supported
+file types. **Files without a mapped profile are not skipped:** they receive the
+usual full-file scan, with no runtime warning. This lets you pass mixed file
+lists (for example ``example.c`` and ``README.md``) and still check prose in
+Markdown while limiting C/C++ scanning to comments.
+
+.. code-block:: sh
+
+    codespell --comments-only example.c
+    codespell --comments-only README.md script.py
+
+Built-in C-family extensions (matched case-insensitively): ``.c``, ``.h``,
+``.cc``, ``.cpp``, ``.cxx``, ``.hh``, ``.hpp``, and ``.hxx``. The built-in
+scanner recognizes ``//`` and ``/* ... */`` comments, string and character
+literals, C++ raw strings, and backslash-newline splices. Preprocessor lines
+remain code; comments inside ``#if 0`` regions are still checked.
+
+``--comments-only`` cannot be combined with ``--write-changes`` or interactive
+mode (``-i``). The ``-I`` ignore-words option remains available.
+
+Custom extension mappings can be supplied in a standalone TOML file:
+
+.. code-block:: sh
+
+    codespell --comments-only --comment-patterns-file comment-patterns.toml
+
+.. code-block:: toml
+
+    [extensions]
+    ".ino" = "c-family"
+    ".custom" = "hash-comments"
+
+    [profiles.hash-comments]
+    line = ["#"]
+    block = [["/*", "*/"]]
+
+    [profiles.derived]
+    inherit = "hash-comments"
+    line = ["#", "//"]
+
+Configured extensions override built-in mappings. Custom profiles are
+marker-based (not full language parsers) and may false-positive inside string
+literals. Firmware trees can map ``.ino`` to ``c-family``; assembler sources
+(``.S``, ``.s``, ``.asm``) and linker scripts (``.ld``) can use explicitly
+configured profiles until dedicated built-in scanners exist.
+
+The ordinary configuration system can set ``comments-only = true`` and
+``comment-patterns-file = "path"`` under ``[tool.codespell]`` in
+``pyproject.toml`` or in ``[codespell]`` INI sections.
+
+**Roadmap:** Python comment tokenization is planned next, then shell; Markdown
+will remain a full prose scan.
+
+**Known limitation:** ``codespell:ignore-next-line`` state does not cross
+``parse_lines()`` fragment boundaries, including boundaries introduced by
+``--ignore-multiline-regex``.
+
 Using a config file
 -------------------
 
