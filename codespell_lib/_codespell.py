@@ -40,6 +40,14 @@ if sys.platform == "win32":
     ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
     STD_OUTPUT_HANDLE = wintypes.HANDLE(-11)
 
+from ._comment_util import (
+    CommentConfigError,
+    CommentRegistry,
+    builtin_registry,
+    concat_fragments,
+    load_patterns_file,
+    repartition_mask,
+)
 from ._spellchecker import Misspelling, build_dict
 from ._text_util import fix_case
 
@@ -674,6 +682,20 @@ def parse_options(
         action="store_true",
         help="output just a single line for each misspelling in stdin mode",
     )
+    parser.add_argument(
+        "--comments-only",
+        action="store_true",
+        default=False,
+        help="check only comments in supported file types; other extensions "
+        "are scanned as usual",
+    )
+    parser.add_argument(
+        "--comment-patterns-file",
+        action="store",
+        type=str,
+        metavar="PATH",
+        help="TOML file mapping file extensions to comment profiles",
+    )
     parser.add_argument("--config", type=str, help="path to config file.")
     parser.add_argument("--toml", type=str, help="path to a pyproject.toml file.")
     parser.add_argument("files", nargs="*", help="files or directories to check")
@@ -977,6 +999,7 @@ def parse_lines(
     uri_ignore_words: set[str],
     context: Optional[tuple[int, int]],
     options: argparse.Namespace,
+    check_lines: Sequence[str] | None = None,
 ) -> tuple[int, bool, list[tuple[int, str, str]]]:
     bad_count = 0
     changed = False
@@ -987,27 +1010,32 @@ def parse_lines(
     next_line_ignore_words: Optional[set[str]] = None
 
     for i, line in enumerate(lines):
-        line = line.rstrip()
+        original_line = line.rstrip()
+        check_line = (
+            check_lines[i].rstrip() if check_lines is not None else original_line
+        )
         # Apply any ignore-next-line directive carried from the previous line.
         pending_next_line_ignore = next_line_ignore_words
         next_line_ignore_words = None
 
         directive_words: set[str] = set()
-        if codespell_ignore_next_line_tag in line:
-            nl_match = ignore_next_line_regex.search(line)
+        if codespell_ignore_next_line_tag in original_line:
+            nl_match = ignore_next_line_regex.search(original_line)
             if nl_match:
                 directive_words = set(
                     filter(None, (nl_match.group("words") or "").split(","))
                 )
                 next_line_ignore_words = directive_words
 
-        if not line or line in exclude_lines:
+        if not original_line or original_line in exclude_lines:
             continue
         line_number = fragment_line_number + i
 
         extra_words_to_ignore: set[str] = set()
         match = (
-            inline_ignore_regex.search(line) if codespell_ignore_tag in line else None
+            inline_ignore_regex.search(original_line)
+            if codespell_ignore_tag in original_line
+            else None
         )
         if match:
             extra_words_to_ignore = set(
@@ -1032,12 +1060,12 @@ def parse_lines(
         # This ensures that if a URI ignore word occurs both inside a URI and
         # outside, it will still be a spelling error.
         if "*" in uri_ignore_words:
-            line = uri_regex.sub(" ", line)
-        check_matches = extract_words_iter(line, word_regex, ignore_word_regex)
+            check_line = uri_regex.sub(" ", check_line)
+        check_matches = extract_words_iter(check_line, word_regex, ignore_word_regex)
         if "*" not in uri_ignore_words:
             check_matches = apply_uri_ignore_words(
                 check_matches,
-                line,
+                check_line,
                 word_regex,
                 ignore_word_regex,
                 uri_regex,
@@ -1055,7 +1083,7 @@ def parse_lines(
                 char_before_idx = match.start() - 1
                 if (
                     char_before_idx >= 0
-                    and line[char_before_idx] == "\\"
+                    and check_line[char_before_idx] == "\\"
                     # bell, backspace, formfeed, newline, carriage-return, tab, vtab.
                     and word.startswith(("a", "b", "f", "n", "r", "t", "v"))
                     and lword[1:] not in misspellings
@@ -1064,7 +1092,7 @@ def parse_lines(
 
                 # An "[sic]" marker right after the word flags it as an
                 # intentional/quoted spelling, so leave it alone.
-                if options.ignore_sic and sic_regex.match(line, match.end()):
+                if options.ignore_sic and sic_regex.match(check_line, match.end()):
                     continue
 
                 context_shown = False
@@ -1156,6 +1184,7 @@ def parse_file(
     uri_ignore_words: set[str],
     context: Optional[tuple[int, int]],
     options: argparse.Namespace,
+    comment_registry: CommentRegistry | None = None,
 ) -> int:
     bad_count = 0
     fragments = None
@@ -1221,10 +1250,27 @@ def parse_file(
     # Parse lines.
     changed = False
     changes_made: list[tuple[int, str, str]] = []
-    for fragment in fragments:
+    masked_fragments: list[tuple[bool, int, list[str]]] | None = None
+    if (
+        options.comments_only
+        and comment_registry is not None
+        and filename != "-"
+        and fragments is not None
+    ):
+        profile_name = comment_registry.lookup_profile(filename)
+        if profile_name is not None:
+            full_text = concat_fragments(fragments)
+            full_mask = comment_registry.mask_text(full_text, profile_name)
+            masked_fragments = repartition_mask(fragments, full_mask)
+
+    for fragment_index, fragment in enumerate(fragments):
         ignore, _, _ = fragment
         if ignore:
             continue
+
+        check_lines: Sequence[str] | None = None
+        if masked_fragments is not None:
+            check_lines = masked_fragments[fragment_index][2]
 
         bad_count_update, changed_update, changes_made_update = parse_lines(
             fragment,
@@ -1240,6 +1286,7 @@ def parse_file(
             uri_ignore_words,
             context,
             options,
+            check_lines=check_lines,
         )
         bad_count += bad_count_update
         changed = changed or changed_update
@@ -1345,6 +1392,13 @@ def main(*args: str) -> int:
 
     if options.interactive > 0:
         options.write_changes = True
+
+    if options.comments_only and (options.write_changes or options.interactive > 0):
+        return _usage_error(
+            parser,
+            "ERROR: --comments-only cannot be used together with "
+            "--write-changes or interactive mode (-i)",
+        )
 
     if options.regex and options.write_changes:
         return _usage_error(
@@ -1472,6 +1526,17 @@ def main(*args: str) -> int:
         ignore_multiline_regex,
     )
 
+    comment_registry: CommentRegistry | None = None
+    if options.comments_only:
+        comment_registry = builtin_registry()
+        if options.comment_patterns_file:
+            try:
+                comment_registry = load_patterns_file(
+                    options.comment_patterns_file, comment_registry
+                )
+            except CommentConfigError as e:
+                return _usage_error(parser, f"ERROR: {e}")
+
     glob_match = GlobMatch(
         flatten_clean_comma_separated_arguments(options.skip) if options.skip else []
     )
@@ -1520,6 +1585,7 @@ def main(*args: str) -> int:
                         uri_ignore_words,
                         context,
                         options,
+                        comment_registry,
                     )
 
                 # skip (relative) directories
@@ -1545,6 +1611,7 @@ def main(*args: str) -> int:
                 uri_ignore_words,
                 context,
                 options,
+                comment_registry,
             )
 
     if summary:
